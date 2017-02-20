@@ -31,20 +31,24 @@
 
 #include <linux/device.h>
 
+#include <linux/seq_file.h>
+#include <linux/proc_fs.h>
+#include <linux/slab.h>
+
 static int simple_major = 0;
 module_param(simple_major, int, 0);
 MODULE_AUTHOR("Jonathan Corbet");
 MODULE_LICENSE("Dual BSD/GPL");
 
-/*
- * Open the device; in fact, there's nothing to do here.
- */
-static int ldd_simple_open (struct inode *inode, struct file *filp)
-{
-	return 0;
-}
 
+/* Data structure for simple */
+static struct simple_data {
+	struct seq_file *m;
+	int index;
+	int buffer[100];
+};
 
+static struct simple_data *data;
 /*
  * Closing is just as simpler.
  */
@@ -52,6 +56,36 @@ static int simple_release(struct inode *inode, struct file *filp)
 {
 	return 0;
 }
+/*
+*
+*/
+
+
+static int simple_fn_proc_show( struct simple_file *m, void *v)
+{	int i;
+	/* write the first lines in the buffer */
+
+	seq_puts(m, "uart_index uart_RX\n");
+	for( i=0; i<100; i++)
+	seq_printf(m,"%i	 %6i \n", i,data-> buffer[i]	);
+	return 0;
+
+}
+static int simple_fn_proc_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, simple_fn_proc_show, NULL);
+}
+
+static const struct file_operations simple_fn_proc_fops = {
+
+	.open		= simple_fn_proc_open,
+	.read		= seq_read,
+	.llseek		= seq_lseek,
+	.release	= single_release,
+};
+
+	
+
 
 
 
@@ -96,18 +130,17 @@ static int simple_remap_mmap(struct file *filp, struct vm_area_struct *vma)
 
 
 /*
- * The fault version.
+ * The nopage version.
  */
-int simple_vma_fault(struct vm_area_struct *vma,
-                struct vm_fault *vmf)
+static int simple_vma_nopage(struct vm_area_struct *vma, struct vm_fault *vmf)
 {
 	struct page *pageptr;
 	unsigned long offset = vma->vm_pgoff << PAGE_SHIFT;
-	unsigned long physaddr = (unsigned long)(vmf->virtual_address - vma->vm_start) + offset;
+	unsigned long physaddr = (unsigned long) vmf->virtual_address - vma->vm_start + offset;
 	unsigned long pageframe = physaddr >> PAGE_SHIFT;
 
 // Eventually remove these printks
-	printk (KERN_NOTICE "---- fault, off %lx phys %lx\n", offset, physaddr);
+	printk (KERN_NOTICE "---- Nopage, off %lx phys %lx\n", offset, physaddr);
 	printk (KERN_NOTICE "VA is %p\n", __va (physaddr));
 	printk (KERN_NOTICE "Page at %p\n", virt_to_page (__va (physaddr)));
 	if (!pfn_valid(pageframe))
@@ -116,25 +149,20 @@ int simple_vma_fault(struct vm_area_struct *vma,
 	printk (KERN_NOTICE "page->index = %ld mapping %p\n", pageptr->index, pageptr->mapping);
 	printk (KERN_NOTICE "Page frame %ld\n", pageframe);
 	get_page(pageptr);
-        vmf->page = pageptr;
+	vmf->page = pageptr;
+
 	return 0;
 }
 
-static struct vm_operations_struct simple_fault_vm_ops = {
+static struct vm_operations_struct simple_nopage_vm_ops = {
 	.open =   simple_vma_open,
 	.close =  simple_vma_close,
-	.fault = simple_vma_fault,
+	.fault = simple_vma_nopage,
 };
 
-static int simple_fault_mmap(struct file *filp, struct vm_area_struct *vma)
+static int simple_nopage_mmap(struct file *filp, struct vm_area_struct *vma)
 {
-	unsigned long offset = vma->vm_pgoff << PAGE_SHIFT;
-
-	if (offset >= __pa(high_memory) || (filp->f_flags & O_SYNC))
-		vma->vm_flags |= VM_IO;
-	vma->vm_flags |= (VM_DONTEXPAND | VM_DONTDUMP);
-
-	vma->vm_ops = &simple_fault_vm_ops;
+	vma->vm_ops = &simple_nopage_vm_ops;
 	simple_vma_open(vma);
 	return 0;
 }
@@ -164,17 +192,18 @@ static void simple_setup_cdev(struct cdev *dev, int minor,
 /* Device 0 uses remap_pfn_range */
 static struct file_operations simple_remap_ops = {
 	.owner   = THIS_MODULE,
-	.open    = ldd_simple_open,
+	.open    = simple_open,
 	.release = simple_release,
 	.mmap    = simple_remap_mmap,
 };
 
-/* Device 1 uses fault */
-static struct file_operations simple_fault_ops = {
+/* Device 1 uses nopage */
+static struct file_operations simple_nopage_ops = {
 	.owner   = THIS_MODULE,
-	.open    = ldd_simple_open,
+	.open    = simple_fn_proc_open,
+	//.open    = simple_open,
 	.release = simple_release,
-	.mmap    = simple_fault_mmap,
+	.mmap    = simple_nopage_mmap,
 };
 
 #define MAX_SIMPLE_DEV 2
@@ -182,7 +211,7 @@ static struct file_operations simple_fault_ops = {
 #if 0
 static struct file_operations *simple_fops[MAX_SIMPLE_DEV] = {
 	&simple_remap_ops,
-	&simple_fault_ops,
+	&simple_nopage_ops,
 };
 #endif
 
@@ -196,7 +225,17 @@ static struct cdev SimpleDevs[MAX_SIMPLE_DEV];
  * Module housekeeping.
  */
 static int simple_init(void)
+
 {
+	
+	//struct simple_data *data ;
+	data = kmalloc(sizeof(*data), GFP_KERNEL);
+	if(!data)
+		return -ENOMEM;
+		int j;	
+		struct class *myclass;
+		printk(KERN_WARNING "simple: insert ....insert ....insert ....insert ........ajor %d\n", simple_major);
+
 	int result;
 	dev_t dev = MKDEV(simple_major, 0);
 
@@ -216,7 +255,19 @@ static int simple_init(void)
 
 	/* Now set up two cdevs. */
 	simple_setup_cdev(SimpleDevs, 0, &simple_remap_ops);
-	simple_setup_cdev(SimpleDevs + 1, 1, &simple_fault_ops);
+	simple_setup_cdev(SimpleDevs + 1, 1, &simple_nopage_ops);
+
+
+/* create sys class file  */
+	myclass = class_create(THIS_MODULE, "test_simaple"); // sys/class/
+	device_create(myclass, NULL, MKDEV(simple_major,0), NULL, "simple");
+
+//****************************************88
+	proc_create("simple",0, NULL, &simple_fn_proc_fops);
+// for test 
+	for (j=0; j<100 ; j++ )
+	data->buffer[j] = j;
+	
 	return 0;
 }
 
@@ -226,6 +277,8 @@ static void simple_cleanup(void)
 	cdev_del(SimpleDevs);
 	cdev_del(SimpleDevs + 1);
 	unregister_chrdev_region(MKDEV(simple_major, 0), 2);
+//****************************************88
+	remove_proc_entry("simple", NULL); // &simple_fn_proc_fops,);
 }
 
 
